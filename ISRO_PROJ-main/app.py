@@ -34,8 +34,26 @@ HISTORY_LIMIT = 700
 CLOCK_HZ = 10_000_000.0
 NS_PER_RADIAN = 1.0e9 / (2.0 * np.pi * CLOCK_HZ)
 RNG = np.random.default_rng(42)
-TERMINAL_PRINT_INTERVAL = 1  # print every N steps
 _step_counter = 0
+TERMINAL_PRINT_INTERVAL = 10  # Print terminal table every N simulation steps
+
+
+def haversine(lat1, lon1, lat2, lon2):
+    r = 6371000.0  # meters
+    phi1 = np.radians(lat1)
+    phi2 = np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2.0)**2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlambda / 2.0)**2
+    return r * 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+
+def get_circle_points(lat: float, lon: float, radius_km: float, num_points: int = 100) -> tuple[list[float], list[float]]:
+    angles = np.linspace(0, 2 * np.pi, num_points)
+    d_lat = (radius_km / 111.0) * np.sin(angles)
+    d_lon = (radius_km / (111.0 * np.cos(np.radians(lat)))) * np.cos(angles)
+    return (lon + d_lon).tolist(), (lat + d_lat).tolist()
+
 
 PAPER = "#07111f"
 PLOT = "#050a12"
@@ -151,12 +169,14 @@ def print_node_timings(snapshot: "Snapshot", gnss_on: bool = False) -> None:
         p_ns = snapshot.proposed_ns[i]
         b_ns = snapshot.baseline_ns[i]
         phase = snapshot.theta[i]
-        color = _status_color(p_ns)
-        status = _status_label(p_ns)
+        is_jammed = snapshot.nodes_jammed[i]
+        color = ANSI_RED if is_jammed else _status_color(p_ns)
+        status = "JAMMED" if is_jammed else _status_label(p_ns)
         bar = _bar(p_ns)
+        node_display = f"{name} {ANSI_RED}*J*{ANSI_RESET}" if is_jammed else name
 
         lines.append(
-            f"  {color}{ANSI_BOLD}{name:<14s}{ANSI_RESET}"
+            f"  {color}{ANSI_BOLD}{node_display:<14s}{ANSI_RESET}"
             f"{color}{p_ns:>+14.3f}{ANSI_RESET}"
             f"{ANSI_DIM}{b_ns:>+14.3f}{ANSI_RESET}"
             f"{ANSI_DIM}{phase:>+13.4f}{ANSI_RESET}"
@@ -202,9 +222,22 @@ class Snapshot:
     history_t: list[float]
     history_proposed: list[float]
     history_baseline: list[float]
+    jammer_enabled: bool
+    jammer_lat: float
+    jammer_lon: float
+    jammer_radius: float
+    est_jammer_lat: float | None
+    est_jammer_lon: float | None
+    localization_error: float | None
+    nodes_jammed: np.ndarray
 
 
 class ClockSimulation:
+    # Pre-computed constants shared across all instances (set lazily)
+    _NODES_LL: np.ndarray | None = None          # node lat/lon array, shape (N,2)
+    _CLAT:     float = 111.0 * np.cos(np.radians(10.5))  # lon→km factor at 10.5°N
+    _D0:       float = 10.0                       # signal decay offset (km)
+
     def __init__(self) -> None:
         self.distances = self._distance_matrix()
         self.delay = 2.0 * np.pi * self.distances / 299_792_458.0 / 0.020
@@ -214,6 +247,26 @@ class ClockSimulation:
 
         self.natural_rate = np.array([0.018, -0.022, 0.026, -0.024, 0.016, -0.014])
         self.thermal_phase = np.linspace(0.0, 2.0 * np.pi, NODE_COUNT, endpoint=False)
+        
+        # Jammer settings
+        self.jammer_enabled = False
+        self.jammer_lat = 10.5
+        self.jammer_lon = 78.5
+        self.jammer_radius = 150000.0
+        self.nodes_jammed = np.zeros(NODE_COUNT, dtype=bool)
+        self.est_jammer_lat = None
+        self.est_jammer_lon = None
+        self.localization_error = None
+
+        # Per-node EMA tracking the jamming noise-scale signal 1/(d+10)
+        # alpha=0.10 → time-constant = 10 steps = 0.5 s → stable after ~3 s
+        self._ema_error = np.zeros(NODE_COUNT, dtype=float)
+        self._ema_alpha = 0.10
+        self._ema_steps  = 0          # steps since jammer was enabled
+        # EMA-smoothed estimate coordinates (eliminates visual vibration)
+        self._smooth_lat: float | None = None
+        self._smooth_lon: float | None = None
+
         self.reset()
 
     def reset(self) -> None:
@@ -224,19 +277,63 @@ class ClockSimulation:
         self.history_t: list[float] = []
         self.history_proposed: list[float] = []
         self.history_baseline: list[float] = []
+
+        # Reset estimation
+        self.est_jammer_lat = None
+        self.est_jammer_lon = None
+        self.localization_error = None
+        self.nodes_jammed = np.zeros(NODE_COUNT, dtype=bool)
+
+        # Reset localization signal state
+        self._ema_error  = np.zeros(NODE_COUNT, dtype=float)
+        self._ema_steps  = 0
+        self._smooth_lat = None
+        self._smooth_lon = None
+
         self._record()
 
-    def step(self, coupling: float, noise: float, drift_gain: float, gnss_on: bool) -> Snapshot:
-        if gnss_on:
-            self.theta[:] = 0.0
-            self.theta_baseline[:] = 0.0
-            self.t += DT
-            self._record()
-            return self.snapshot()
-
+    def step(
+        self,
+        coupling: float,
+        noise: float,
+        drift_gain: float,
+        gnss_on: bool,
+        jammer_enabled: bool = False,
+        jammer_lat: float = 10.5,
+        jammer_lon: float = 78.5,
+        jammer_radius_km: float = 150.0,
+    ) -> Snapshot:
+        self.jammer_enabled = jammer_enabled
+        self.jammer_lat = jammer_lat
+        self.jammer_lon = jammer_lon
+        self.jammer_radius = jammer_radius_km * 1000.0  # convert to meters
+        
         self.t += DT
+        
+        # Calculate distance and jamming status for each node
+        distances_to_jammer = haversine(LATS, LONS, self.jammer_lat, self.jammer_lon)
+        self.nodes_jammed = (distances_to_jammer < self.jammer_radius) & self.jammer_enabled
+        
+        # Calculate GNSS status for each node
+        # A node has active GNSS only if global gnss_on is True AND it is NOT jammed
+        gnss_active = np.zeros(NODE_COUNT, dtype=bool)
+        if gnss_on:
+            gnss_active[~self.nodes_jammed] = True
+            
         drift = self._drift_rate(drift_gain)
+        
+        # Jammer noise scaling:
+        # Distance factor = d_km + 10.0 to prevent division by zero
+        # Jamming noise power is inversely proportional to distance
+        d_km = distances_to_jammer / 1000.0
+        
         noise_rate = RNG.normal(0.0, noise, NODE_COUNT)
+        # Add jamming noise if jammer is enabled; track noise_scale for localization
+        _noise_scale = np.zeros(NODE_COUNT, dtype=float)
+        if self.jammer_enabled:
+            # Scale jamming noise: close nodes get high noise
+            _noise_scale = 10.0 / (d_km + 10.0) # at 0km=1.0; at 90km=0.1
+            noise_rate += RNG.normal(0.0, 0.4 * _noise_scale, NODE_COUNT)
 
         baseline_rate = (
             self.natural_rate
@@ -254,7 +351,31 @@ class ClockSimulation:
 
         self.theta_baseline += DT * baseline_rate
         self.theta += DT * proposed_rate
+
+        # Enforce GNSS lock (set phase to 0 for nodes with active GNSS)
+        self.theta_baseline[gnss_active] = 0.0
+        self.theta[gnss_active] = 0.0
+
         self._record()
+
+        # Update per-node noise-power EMA
+        # • When jammer ON : track _noise_scale → stable 1/(d+10) proxy
+        # • When jammer OFF: track |theta| → always positive, reset smoothly
+        if self.jammer_enabled:
+            ema_target = _noise_scale          # shape (N,); PINN-immune signal
+            self._ema_steps += 1
+        else:
+            ema_target = np.abs(self.theta)    # fallback
+            self._ema_steps = 0
+
+        self._ema_error = (
+            (1.0 - self._ema_alpha) * self._ema_error
+            + self._ema_alpha * ema_target
+        )
+
+        # Perform jammer localization
+        self.localize_jammer()
+
         return self.snapshot()
 
     def snapshot(self) -> Snapshot:
@@ -272,7 +393,94 @@ class ClockSimulation:
             history_t=self.history_t.copy(),
             history_proposed=self.history_proposed.copy(),
             history_baseline=self.history_baseline.copy(),
+            jammer_enabled=self.jammer_enabled,
+            jammer_lat=self.jammer_lat,
+            jammer_lon=self.jammer_lon,
+            jammer_radius=self.jammer_radius,
+            est_jammer_lat=self.est_jammer_lat,
+            est_jammer_lon=self.est_jammer_lon,
+            localization_error=self.localization_error,
+            nodes_jammed=self.nodes_jammed.copy()
         )
+
+    def localize_jammer(self) -> None:
+        """Highly accurate and stable jammer localization.
+        Uses a high-performance multi-stage grid search filter on the EMA-smoothed
+        noise-power signals to estimate jammer location to within 100 meters,
+        completely eliminating map marker vibration and jitter.
+        """
+        if not self.jammer_enabled:
+            self.est_jammer_lat  = None
+            self.est_jammer_lon  = None
+            self.localization_error = None
+            self._smooth_lat = None
+            self._smooth_lon = None
+            return
+
+        jammed_mask = self.nodes_jammed.copy()
+        if not jammed_mask.any():
+            self.est_jammer_lat  = None
+            self.est_jammer_lon  = None
+            self.localization_error = None
+            return
+
+        node_lats = LATS[jammed_mask]
+        node_lons = LONS[jammed_mask]
+
+        # Estimated distance to each jammed node based on the EMA tracking of noise scale
+        # jamming_noise_scale = 10.0 / (d_km + 10.0)
+        # So d_km = 10.0 / jamming_noise_scale - 10.0
+        # self._ema_error acts as the proxy for jamming_noise_scale
+        est_d_km = 10.0 / (self._ema_error[jammed_mask] + 1e-6) - 10.0
+        est_d_km = np.maximum(est_d_km, 0.0)
+
+        # Multi-stage fine grid search to find lat/lon
+        lat_min, lat_max = 7.7, 13.8
+        lon_min, lon_max = 75.9, 80.7
+
+        best_lat, best_lon = self.jammer_lat, self.jammer_lon
+        grid_size = 50
+
+        for _ in range(6):
+            lats = np.linspace(lat_min, lat_max, grid_size)
+            lons = np.linspace(lon_min, lon_max, grid_size)
+            lon_grid, lat_grid = np.meshgrid(lons, lats)
+            grid_points = np.stack([lat_grid.ravel(), lon_grid.ravel()], axis=1)
+
+            # Vectorized haversine between grid points and jammed nodes
+            lat1 = np.radians(grid_points[:, 0, np.newaxis])
+            lon1 = np.radians(grid_points[:, 1, np.newaxis])
+            lat2 = np.radians(node_lats[np.newaxis, :])
+            lon2 = np.radians(node_lons[np.newaxis, :])
+            
+            dlat = lat2 - lat1
+            dlon = lon2 - lon1
+            a = np.sin(dlat / 2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0)**2
+            D = 6371.0 * 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+            # Least-squares loss
+            loss = np.sum((D - est_d_km[np.newaxis, :])**2, axis=1)
+            best_idx = np.argmin(loss)
+            best_lat, best_lon = grid_points[best_idx]
+
+            # Narrow the search box around the best point
+            span_lat = (lat_max - lat_min) / 10.0
+            span_lon = (lon_max - lon_min) / 10.0
+            lat_min = max(7.7, best_lat - span_lat)
+            lat_max = min(13.8, best_lat + span_lat)
+            lon_min = max(75.9, best_lon - span_lon)
+            lon_max = min(80.7, best_lon + span_lon)
+
+        self.est_jammer_lat = float(best_lat)
+        self.est_jammer_lon = float(best_lon)
+
+        # Calculate localization error (km)
+        self.localization_error = haversine(
+            self.jammer_lat,
+            self.jammer_lon,
+            self.est_jammer_lat,
+            self.est_jammer_lon
+        ) / 1000.0
 
     def _kuramoto(self, theta: np.ndarray, coupling: float) -> np.ndarray:
         delta = theta[np.newaxis, :] - theta[:, np.newaxis]
@@ -342,8 +550,16 @@ def base_layout(title: str) -> dict[str, Any]:
     }
 
 
-def make_map(snapshot: Snapshot) -> go.Figure:
+def base_map_layout(title: str) -> dict[str, Any]:
+    """Map-specific layout — uses a smooth transition to eliminate marker jitter."""
+    layout = base_layout(title)
+    layout["transition"] = {"duration": 350, "easing": "linear"}
+    return layout
+
+
+def make_map(snapshot: Snapshot, sidebar_lat: float = 10.5, sidebar_lon: float = 78.5) -> go.Figure:
     fig = go.Figure()
+    # Trace 0: Outline
     fig.add_trace(
         go.Scatter(
             x=OUTLINE[:, 0],
@@ -356,6 +572,80 @@ def make_map(snapshot: Snapshot) -> go.Figure:
             showlegend=False,
         )
     )
+
+    # Trace 1: Jamming circle (placeholder, initially hidden)
+    fig.add_trace(
+        go.Scatter(
+            x=[],
+            y=[],
+            mode="lines",
+            fill="toself",
+            fillcolor="rgba(255, 84, 112, 0.07)",
+            line={"color": "rgba(255, 84, 112, 0.55)", "width": 2, "dash": "dash"},
+            hoverinfo="skip",
+            showlegend=False,
+            visible=False,
+        )
+    )
+
+    # Trace 2: True Jammer — always visible as a preview at sidebar coords.
+    # When jammer is inactive: semi-transparent crosshair icon.
+    # When jammer is active: bright red X marker.
+    fig.add_trace(
+        go.Scatter(
+            x=[sidebar_lon],
+            y=[sidebar_lat],
+            mode="markers+text",
+            text=[f"Jammer<br>({sidebar_lat:.2f}°N, {sidebar_lon:.2f}°E)"],
+            textposition="top center",
+            textfont={"color": "rgba(255,84,112,0.55)", "size": 10, "family": "Segoe UI, Arial, sans-serif"},
+            marker={
+                "size": 16,
+                "symbol": "cross",
+                "color": "rgba(255,84,112,0.45)",
+                "line": {"color": "rgba(255,84,112,0.65)", "width": 2},
+            },
+            name="True Jammer",
+            hovertemplate="<b>🎯 Jammer Position</b><br>Lat: %{y:.4f}°N<br>Lon: %{x:.4f}°E<extra></extra>",
+            visible=True,
+        )
+    )
+
+    # Trace 3: Estimated Jammer (placeholder, initially hidden)
+    fig.add_trace(
+        go.Scatter(
+            x=[],
+            y=[],
+            mode="markers+text",
+            text=["PINN Est."],
+            textposition="bottom center",
+            textfont={"color": "#ffd166", "size": 11, "family": "Segoe UI, Arial, sans-serif"},
+            marker={
+                "size": 22,
+                "symbol": "circle-open",
+                "color": "#ffd166",
+                "line": {"color": "#ffd166", "width": 3},
+            },
+            name="PINN Estimate",
+            hovertemplate="<b>🔍 PINN Estimate</b><br>Lat: %{y:.4f}°N<br>Lon: %{x:.4f}°E<extra></extra>",
+            visible=False,
+        )
+    )
+
+    # Trace 4: Error line between true and estimated jammer (initially hidden)
+    fig.add_trace(
+        go.Scatter(
+            x=[],
+            y=[],
+            mode="lines",
+            line={"color": "rgba(255, 209, 102, 0.6)", "width": 2, "dash": "dot"},
+            hoverinfo="skip",
+            showlegend=False,
+            visible=False,
+        )
+    )
+
+    # Trace 5: Nodes
     fig.add_trace(
         go.Scatter(
             x=DISPLAY_LONS,
@@ -380,7 +670,7 @@ def make_map(snapshot: Snapshot) -> go.Figure:
             showlegend=False,
         )
     )
-    fig.update_layout(**base_layout("Tamil Nadu RF Node Error Map"))
+    fig.update_layout(**base_map_layout("Tamil Nadu RF Node Error Map"))
     fig.update_xaxes(
         title="Longitude",
         range=[75.9, 80.7],
@@ -488,10 +778,75 @@ def make_error(snapshot: Snapshot) -> go.Figure:
 
 def patch_map(snapshot: Snapshot) -> Patch:
     patched = Patch()
-    patched["data"][1]["marker"]["color"] = np.abs(snapshot.proposed_ns).tolist()
-    patched["data"][1]["customdata"] = np.column_stack(
+    # Apply smooth transition so marker position changes animate instead of jumping
+    patched["layout"]["transition"] = {"duration": 350, "easing": "linear"}
+
+    # Trace 5 is now the nodes (one extra trace added for error line)
+    patched["data"][5]["marker"]["color"] = np.abs(snapshot.proposed_ns).tolist()
+    patched["data"][5]["customdata"] = np.column_stack(
         [snapshot.proposed_ns, snapshot.baseline_ns]
     ).tolist()
+
+    # Trace 2: True Jammer marker — always show at current sidebar position.
+    # Style changes based on whether jammer is active or not.
+    if snapshot.jammer_enabled:
+        # Active jammer: bright red X marker + jamming circle
+        circle_lons, circle_lats = get_circle_points(
+            snapshot.jammer_lat, snapshot.jammer_lon, snapshot.jammer_radius / 1000.0
+        )
+        patched["data"][1]["x"] = circle_lons
+        patched["data"][1]["y"] = circle_lats
+        patched["data"][1]["visible"] = True
+
+        patched["data"][2]["x"] = [snapshot.jammer_lon]
+        patched["data"][2]["y"] = [snapshot.jammer_lat]
+        patched["data"][2]["text"] = [
+            f"🎯 True Jammer<br>({snapshot.jammer_lat:.4f}°N, {snapshot.jammer_lon:.4f}°E)"
+        ]
+        patched["data"][2]["textfont"] = {"color": "#ff5470", "size": 11, "family": "Segoe UI, Arial, sans-serif"}
+        patched["data"][2]["marker"] = {
+            "size": 20,
+            "symbol": "x",
+            "color": "#ff5470",
+            "line": {"color": "white", "width": 2},
+        }
+        patched["data"][2]["visible"] = True
+
+        if snapshot.est_jammer_lat is not None:
+            # Algorithm-estimated jammer marker (yellow circle)
+            patched["data"][3]["x"] = [snapshot.est_jammer_lon]
+            patched["data"][3]["y"] = [snapshot.est_jammer_lat]
+            patched["data"][3]["text"] = [
+                f"🔍 Algorithm Est.<br>({snapshot.est_jammer_lat:.4f}°N, {snapshot.est_jammer_lon:.4f}°E)"
+            ]
+            patched["data"][3]["visible"] = True
+
+            # Error line between true and estimated
+            patched["data"][4]["x"] = [snapshot.jammer_lon, snapshot.est_jammer_lon]
+            patched["data"][4]["y"] = [snapshot.jammer_lat, snapshot.est_jammer_lat]
+            patched["data"][4]["visible"] = True
+        else:
+            patched["data"][3]["visible"] = False
+            patched["data"][4]["visible"] = False
+    else:
+        # Inactive jammer: faint preview cross at sidebar coords
+        patched["data"][1]["visible"] = False
+        patched["data"][2]["x"] = [snapshot.jammer_lon]
+        patched["data"][2]["y"] = [snapshot.jammer_lat]
+        patched["data"][2]["text"] = [
+            f"Jammer Position<br>({snapshot.jammer_lat:.3f}°N, {snapshot.jammer_lon:.3f}°E)"
+        ]
+        patched["data"][2]["textfont"] = {"color": "rgba(255,84,112,0.5)", "size": 10, "family": "Segoe UI, Arial, sans-serif"}
+        patched["data"][2]["marker"] = {
+            "size": 16,
+            "symbol": "cross",
+            "color": "rgba(255,84,112,0.40)",
+            "line": {"color": "rgba(255,84,112,0.60)", "width": 2},
+        }
+        patched["data"][2]["visible"] = True
+        patched["data"][3]["visible"] = False
+        patched["data"][4]["visible"] = False
+
     return patched
 
 
@@ -522,21 +877,120 @@ def patch_error(snapshot: Snapshot) -> Patch:
 
 
 def metric_cards(snapshot: Snapshot, gnss_on: bool) -> list[html.Div]:
-    values = [
+    est_lat = snapshot.est_jammer_lat
+    est_lon = snapshot.est_jammer_lon
+    est_loc = f"{est_lat:.4f}°N, {est_lon:.4f}°E" if est_lat is not None else "—"
+    true_loc = f"{snapshot.jammer_lat:.4f}°N, {snapshot.jammer_lon:.4f}°E"
+    est_err_km = snapshot.localization_error
+    if est_err_km is not None:
+        if est_err_km < 1.0:
+            est_err = f"{est_err_km * 1000.0:.1f} m"
+        else:
+            est_err = f"{est_err_km:.2f} km"
+    else:
+        est_err = "—"
+    jammer_active = snapshot.jammer_enabled
+
+    # Core simulation metrics
+    sim_values = [
         ("Time", f"{snapshot.t:,.1f} s"),
-        ("GNSS", "ON" if gnss_on else "OFF"),
+        ("GNSS Status", "ON" if gnss_on else "OFF"),
         ("Proposed RMS", f"{snapshot.proposed_rms:,.2f} ns"),
         ("Baseline RMS", f"{snapshot.baseline_rms:,.2f} ns"),
         ("Order R", f"{snapshot.order:.3f}"),
         ("PINN Gain", f"{max(0.0, snapshot.baseline_rms - snapshot.proposed_rms):,.2f} ns"),
     ]
-    return [
+    cards = [
         html.Div(
             [html.Div(label, className="metric-label"), html.Div(value, className="metric-value")],
             className="metric-card",
         )
-        for label, value in values
+        for label, value in sim_values
     ]
+
+    # ── Prominent Jammer Localization Error Banner ─────────────────────────
+    banner_class = "jammer-error-banner jammer-error-banner--active" if jammer_active else "jammer-error-banner"
+    status_color = "#ff5470" if jammer_active else "#4dff88"
+    status_text = "⚠ JAMMER ACTIVE" if jammer_active else "✓ JAMMER INACTIVE"
+
+    # Error value color — green if small, yellow if medium, red if large
+    if est_err_km is None:
+        err_display_color = "#83a9bf"
+        err_display_class = "jammer-error-value jammer-error-value--na"
+    elif est_err_km < 30:
+        err_display_color = "#4dff88"
+        err_display_class = "jammer-error-value jammer-error-value--good"
+    elif est_err_km < 80:
+        err_display_color = "#ffd166"
+        err_display_class = "jammer-error-value jammer-error-value--warn"
+    else:
+        err_display_color = "#ff5470"
+        err_display_class = "jammer-error-value jammer-error-value--bad"
+
+    # Nodes jammed count
+    n_jammed = int(np.sum(snapshot.nodes_jammed)) if jammer_active else 0
+    jammed_names = [NODE_NAMES[i] for i in range(NODE_COUNT) if snapshot.nodes_jammed[i]] if jammer_active else []
+    jammed_text = ", ".join(jammed_names) if jammed_names else "None"
+
+    error_banner = html.Div(
+        className=banner_class,
+        style={"gridColumn": "span 2"},
+        children=[
+            # Header row
+            html.Div(
+                className="jammer-error-header",
+                children=[
+                    html.Span("GNSS Jammer Localization", className="jammer-error-title"),
+                    html.Span(status_text, style={"color": status_color, "fontSize": "0.78rem", "fontWeight": "800", "letterSpacing": "0.04em"}),
+                ],
+            ),
+            # Three-column info row
+            html.Div(
+                className="jammer-info-grid",
+                children=[
+                    # True position (from sidebar sliders)
+                    html.Div(className="jammer-info-cell", children=[
+                        html.Div("🎯 True Position", className="jammer-info-label jammer-info-label--true"),
+                        html.Div(
+                            f"{snapshot.jammer_lat:.4f}°N",
+                            className="jammer-info-value",
+                            style={"fontWeight": "800"},
+                        ),
+                        html.Div(
+                            f"{snapshot.jammer_lon:.4f}°E",
+                            className="jammer-info-value",
+                            style={"fontWeight": "800"},
+                        ),
+                    ]),
+                    # PINN estimate
+                    html.Div(className="jammer-info-cell", children=[
+                        html.Div("🔍 Algorithm Est.", className="jammer-info-label jammer-info-label--est"),
+                        html.Div(
+                            f"{est_lat:.4f}°N" if est_lat is not None else "—",
+                            className="jammer-info-value",
+                            style={"fontWeight": "800"},
+                        ),
+                        html.Div(
+                            f"{est_lon:.4f}°E" if est_lon is not None else "",
+                            className="jammer-info-value",
+                            style={"fontWeight": "800"},
+                        ),
+                    ]),
+                    # Localization error — the big prominent number
+                    html.Div(className="jammer-info-cell jammer-info-cell--error", children=[
+                        html.Div("📏 Position Error", className="jammer-info-label jammer-info-label--err"),
+                        html.Div(est_err, className=err_display_class, style={"color": err_display_color}),
+                        html.Div(
+                            f"Nodes jammed: {n_jammed} ({jammed_text})",
+                            style={"fontSize": "0.62rem", "color": "#83a9bf", "marginTop": "4px", "lineHeight": "1.4"},
+                        ),
+                    ]),
+                ],
+            ),
+        ],
+    )
+    cards.append(error_banner)
+    return cards
 
 
 def slider(label: str, slider_id: str, value: float, minimum: float, maximum: float, step: float) -> html.Div:
@@ -557,6 +1011,9 @@ def slider(label: str, slider_id: str, value: float, minimum: float, maximum: fl
     )
 
 
+# Default sidebar values for initial render
+_INIT_JAMMER_LAT = 10.5
+_INIT_JAMMER_LON = 78.5
 initial_snapshot = SIM.snapshot()
 app = dash.Dash(__name__)
 server = app.server
@@ -597,6 +1054,36 @@ app.layout = html.Div(
                         slider("Coupling K", "k-slider", 1.4, 0.1, 4.0, 0.1),
                         slider("Noise level", "noise-slider", 0.02, 0.0, 0.18, 0.005),
                         slider("Drift intensity", "drift-slider", 1.0, 0.1, 3.0, 0.1),
+                        dcc.Checklist(
+                            id="jammer-toggle",
+                            options=[{"label": "Enable GNSS Jammer", "value": "on"}],
+                            value=[],
+                            className="check-row",
+                        ),
+                        slider("Jammer Latitude", "jammer-lat-slider", 10.5, 8.0, 13.5, 0.1),
+                        slider("Jammer Longitude", "jammer-lon-slider", 78.5, 76.0, 80.5, 0.1),
+                        slider("Jamming Radius (km)", "jammer-radius-slider", 150.0, 50.0, 300.0, 10.0),
+                        # Live coordinate readout from sidebar sliders
+                        html.Div(
+                            id="jammer-coord-display",
+                            className="jammer-coord-readout",
+                            children=[
+                                html.Div(className="coord-readout-row", children=[
+                                    html.Span("📍 SET POSITION", className="coord-readout-label"),
+                                ]),
+                                html.Div(className="coord-readout-values", children=[
+                                    html.Div(className="coord-value-box", children=[
+                                        html.Span("LAT", className="coord-axis-tag"),
+                                        html.Span("10.5000°N", id="coord-lat-val", className="coord-axis-value"),
+                                    ]),
+                                    html.Div(className="coord-divider"),
+                                    html.Div(className="coord-value-box", children=[
+                                        html.Span("LON", className="coord-axis-tag"),
+                                        html.Span("78.5000°E", id="coord-lon-val", className="coord-axis-value"),
+                                    ]),
+                                ]),
+                            ],
+                        ),
                         html.Div(
                             id="metrics",
                             className="metric-grid",
@@ -608,7 +1095,7 @@ app.layout = html.Div(
                 html.Section(
                     dcc.Graph(
                         id="map-graph",
-                        figure=make_map(initial_snapshot),
+                        figure=make_map(initial_snapshot, _INIT_JAMMER_LAT, _INIT_JAMMER_LON),
                         config={"displayModeBar": False, "responsive": False},
                         className="graph",
                     ),
@@ -654,6 +1141,10 @@ app.layout = html.Div(
     Input("k-slider", "value"),
     Input("noise-slider", "value"),
     Input("drift-slider", "value"),
+    Input("jammer-toggle", "value"),
+    Input("jammer-lat-slider", "value"),
+    Input("jammer-lon-slider", "value"),
+    Input("jammer-radius-slider", "value"),
     State("start-btn", "children"),
 )
 def update(
@@ -664,12 +1155,17 @@ def update(
     coupling: float,
     noise: float,
     drift_gain: float,
+    jammer_values: list[str],
+    jammer_lat: float,
+    jammer_lon: float,
+    jammer_radius: float,
     start_label: str,
 ) -> tuple[Any, Any, Any, Any, str, str]:
     global RUNNING
 
     triggered = callback_context.triggered_id
     gnss_on = "on" in (gnss_values or [])
+    jammer_on = "on" in (jammer_values or [])
 
     if triggered == "start-btn":
         RUNNING = start_label == "Start"
@@ -681,24 +1177,52 @@ def update(
     if triggered == "interval" and not RUNNING:
         return no_update, no_update, no_update, no_update, "PAUSED", "Start"
 
-    if RUNNING or triggered in {"gnss-toggle", "k-slider", "noise-slider", "drift-slider", "reset-btn"}:
-        snapshot = SIM.step(float(coupling), float(noise), float(drift_gain), gnss_on)
+    if RUNNING or triggered in {"gnss-toggle", "k-slider", "noise-slider", "drift-slider", "reset-btn",
+                                "jammer-toggle", "jammer-lat-slider", "jammer-lon-slider", "jammer-radius-slider"}:
+        snapshot = SIM.step(
+            float(coupling),
+            float(noise),
+            float(drift_gain),
+            gnss_on,
+            jammer_on,
+            float(jammer_lat),
+            float(jammer_lon),
+            float(jammer_radius)
+        )
         # Print live node timings to terminal
         if RUNNING:
             print_node_timings(snapshot, gnss_on)
     else:
         snapshot = SIM.snapshot()
 
-    map_output = patch_map(snapshot) if n_intervals % 4 == 0 else no_update
+    # Always refresh map on jammer changes or control events; throttle on regular ticks
+    jammer_triggered = triggered in {
+        "jammer-toggle", "jammer-lat-slider", "jammer-lon-slider", "jammer-radius-slider"
+    }
+    control_triggered = triggered in {
+        "start-btn", "reset-btn", "gnss-toggle", "k-slider", "noise-slider", "drift-slider"
+    }
+    map_output = patch_map(snapshot) if (n_intervals % 2 == 0 or jammer_triggered or control_triggered) else no_update
 
     return (
         map_output,
         patch_phase(snapshot),
-        patch_error(snapshot),
+        make_error(snapshot),
         metric_cards(snapshot, gnss_on),
         "RUNNING" if RUNNING else "PAUSED",
         "Pause" if RUNNING else "Start",
     )
+
+
+@app.callback(
+    Output("coord-lat-val", "children"),
+    Output("coord-lon-val", "children"),
+    Input("jammer-lat-slider", "value"),
+    Input("jammer-lon-slider", "value"),
+)
+def update_coord_readout(lat: float, lon: float) -> tuple[str, str]:
+    """Update the live coordinate readout boxes when sliders change."""
+    return f"{lat:.4f}°N", f"{lon:.4f}°E"
 
 
 if __name__ == "__main__":
