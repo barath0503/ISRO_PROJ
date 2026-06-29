@@ -1,290 +1,576 @@
-from __future__ import annotations
+:root {
+    --bg: #02050b;
+    --panel: #07111f;
+    --panel-strong: #0a1728;
+    --cyan: #35f6ff;
+    --blue: #176bff;
+    --red: #ff5470;
+    --text: #d8f3ff;
+    --muted: #83a9bf;
+    --line: rgba(117, 211, 255, 0.18);
+}
 
-from dataclasses import dataclass
+* {
+    box-sizing: border-box;
+}
 
-import numpy as np
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: Inter, "Segoe UI", Arial, sans-serif;
+}
 
-from rf_sync_dashboard.config import (
-    CLOCK_FREQUENCY_HZ,
-    LATITUDES,
-    LONGITUDES,
-    MAX_HISTORY_POINTS,
-    NODE_NAMES,
-    NODES,
-    NS_PER_RADIAN,
-    RNG_SEED,
-    SPEED_OF_LIGHT_MPS,
-    SYNC_WAVE_PERIOD_S,
-)
+.app-shell {
+    min-height: 100vh;
+    padding: 18px;
+    background:
+        radial-gradient(circle at 12% 6%, rgba(23, 107, 255, 0.16), transparent 30%),
+        linear-gradient(135deg, #02050b 0%, #06101d 54%, #02050b 100%);
+}
+
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    min-height: 72px;
+    margin-bottom: 16px;
+    padding: 18px 20px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(7, 17, 31, 0.88);
+    box-shadow: 0 0 24px rgba(53, 246, 255, 0.08);
+}
+
+.title {
+    font-size: clamp(1.15rem, 2vw, 1.75rem);
+    font-weight: 750;
+    letter-spacing: 0;
+}
+
+.subtitle {
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 0.95rem;
+}
+
+.status-strip {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+.status-pill {
+    min-width: 96px;
+    padding: 8px 11px;
+    border: 1px solid rgba(53, 246, 255, 0.28);
+    border-radius: 6px;
+    background: rgba(8, 28, 48, 0.86);
+    color: var(--text);
+    text-align: center;
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: 330px minmax(360px, 1fr) minmax(360px, 0.82fr);
+    grid-template-rows: minmax(390px, calc((100vh - 130px) * 0.58)) minmax(300px, calc((100vh - 130px) * 0.42));
+    gap: 16px;
+}
+
+.panel {
+    min-width: 0;
+    min-height: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(7, 17, 31, 0.92);
+    box-shadow: 0 0 28px rgba(0, 0, 0, 0.34);
+    overflow: hidden;
+}
+
+.control-panel {
+    grid-row: 1 / span 2;
+    padding: 18px;
+    overflow-y: auto;
+}
+
+.map-panel,
+.phase-panel,
+.error-panel {
+    padding: 0;
+}
+
+.error-panel {
+    grid-column: 2 / span 2;
+}
+
+.panel-heading {
+    margin-bottom: 16px;
+    color: var(--text);
+    font-size: 1rem;
+    font-weight: 750;
+}
+
+.button-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 18px;
+}
+
+button {
+    height: 42px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    color: var(--text);
+    font: inherit;
+    font-weight: 750;
+    cursor: pointer;
+}
+
+.primary-button {
+    background: linear-gradient(135deg, var(--blue), #00a7ff);
+    box-shadow: 0 0 16px rgba(53, 246, 255, 0.25);
+}
+
+.secondary-button {
+    border-color: rgba(117, 211, 255, 0.26);
+    background: #0b1d32;
+}
+
+button:hover {
+    filter: brightness(1.12);
+}
+
+.toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 0 16px;
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+    font-weight: 700;
+}
+
+.switch label {
+    position: relative;
+    display: inline-block;
+    width: 54px;
+    height: 30px;
+}
+
+.switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.switch label::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border: 1px solid rgba(117, 211, 255, 0.28);
+    border-radius: 999px;
+    background: #182335;
+    transition: 160ms ease;
+}
+
+.switch label::after {
+    content: "";
+    position: absolute;
+    top: 4px;
+    left: 5px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: #7892a8;
+    transition: 160ms ease;
+}
+
+.switch label:has(input:checked)::before {
+    background: rgba(53, 246, 255, 0.28);
+    border-color: rgba(53, 246, 255, 0.70);
+}
+
+.switch label:has(input:checked)::after {
+    left: 27px;
+    background: var(--cyan);
+    box-shadow: 0 0 12px rgba(53, 246, 255, 0.72);
+}
+
+.control-block {
+    margin-top: 20px;
+}
+
+.control-block label {
+    display: block;
+    margin-bottom: 8px;
+    color: var(--muted);
+    font-size: 0.88rem;
+    font-weight: 750;
+}
+
+.control-block .rc-slider-track {
+    background-color: var(--cyan);
+}
+
+.control-block .rc-slider-rail {
+    background-color: #1a2a3f;
+}
+
+.control-block .rc-slider-handle {
+    border-color: var(--cyan);
+    background-color: var(--cyan);
+    box-shadow: 0 0 10px rgba(53, 246, 255, 0.62);
+}
+
+.control-block .rc-slider-mark-text {
+    color: var(--muted);
+}
+
+.metric-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-top: 22px;
+}
+
+.metric-card {
+    min-height: 72px;
+    padding: 12px;
+    border: 1px solid rgba(117, 211, 255, 0.14);
+    border-radius: 8px;
+    background: rgba(10, 23, 40, 0.86);
+}
+
+.metric-label {
+    color: var(--muted);
+    font-size: 0.76rem;
+    font-weight: 700;
+}
+
+.metric-value {
+    margin-top: 8px;
+    color: var(--text);
+    font-size: 1rem;
+    font-weight: 760;
+    overflow-wrap: anywhere;
+}
+
+.graph {
+    width: 100%;
+    height: 100%;
+}
+
+.graph [data-dash-is-loading="true"],
+.graph[data-dash-is-loading="true"] {
+    opacity: 1 !important;
+    visibility: visible !important;
+}
+
+.graph .dash-spinner {
+    display: none !important;
+}
+
+.graph .js-plotly-plot {
+    width: 100%;
+    height: 100%;
+}
+
+@media (max-width: 1180px) {
+    .dashboard-grid {
+        grid-template-columns: 300px 1fr;
+        grid-template-rows: 420px 420px 340px;
+    }
+
+    .control-panel {
+        grid-row: 1 / span 3;
+    }
+
+    .phase-panel {
+        grid-column: 2;
+    }
+
+    .error-panel {
+        grid-column: 2;
+    }
+}
+
+@media (max-width: 860px) {
+    .app-shell {
+        padding: 12px;
+    }
+
+    .topbar {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .status-strip {
+        justify-content: flex-start;
+    }
+
+    .dashboard-grid {
+        display: flex;
+        flex-direction: column;
+    }
+
+    .control-panel {
+        max-height: none;
+    }
+
+    .map-panel,
+    .phase-panel,
+    .error-panel {
+        height: 390px;
+    }
+}
+
+/* ── Jammer Localization Panel ─────────────────────────────── */
+.jammer-panel-active {
+    border: 1px solid rgba(255, 84, 112, 0.6) !important;
+    background: rgba(40, 10, 18, 0.88) !important;
+    box-shadow: 0 0 18px rgba(255, 84, 112, 0.18);
+    animation: jammer-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes jammer-pulse {
+    0%   { box-shadow: 0 0 10px rgba(255, 84, 112, 0.15); }
+    50%  { box-shadow: 0 0 26px rgba(255, 84, 112, 0.38); }
+    100% { box-shadow: 0 0 10px rgba(255, 84, 112, 0.15); }
+}
+
+.jammer-section-heading {
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 18px 0 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--line);
+}
+
+.loc-error-highlight {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: rgba(255, 209, 102, 0.07);
+    border: 1px solid rgba(255, 209, 102, 0.28);
+    font-size: 0.88rem;
+    font-weight: 700;
+}
+
+.loc-error-value {
+    color: #ffd166;
+    font-size: 1.1rem;
+    font-weight: 800;
+}
+
+.loc-error-na {
+    color: #83a9bf;
+    font-size: 1.0rem;
+    font-weight: 700;
+}
+
+.check-row {
+    padding: 12px 0;
+    border-top: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 0.88rem;
+    font-weight: 700;
+}
+
+/* ── Jammer Error Banner ─────────────────────────────────────── */
+.jammer-error-banner {
+    padding: 14px;
+    border-radius: 10px;
+    border: 1px solid rgba(117, 211, 255, 0.18);
+    background: rgba(10, 23, 40, 0.92);
+    transition: border-color 0.4s ease, background 0.4s ease;
+}
+
+.jammer-error-banner--active {
+    border-color: rgba(255, 84, 112, 0.60);
+    background: rgba(35, 8, 16, 0.92);
+    box-shadow: 0 0 20px rgba(255, 84, 112, 0.14);
+    animation: banner-pulse 2.6s ease-in-out infinite;
+}
+
+@keyframes banner-pulse {
+    0%   { box-shadow: 0 0 10px rgba(255, 84, 112, 0.12); }
+    50%  { box-shadow: 0 0 28px rgba(255, 84, 112, 0.32); }
+    100% { box-shadow: 0 0 10px rgba(255, 84, 112, 0.12); }
+}
+
+.jammer-error-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgba(117, 211, 255, 0.12);
+}
+
+.jammer-error-title {
+    color: var(--muted);
+    font-size: 0.72rem;
+    font-weight: 800;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+}
+
+.jammer-info-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10px;
+}
+
+.jammer-info-cell {
+    padding: 10px;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(117, 211, 255, 0.09);
+}
+
+.jammer-info-cell--error {
+    background: rgba(255, 209, 102, 0.06);
+    border-color: rgba(255, 209, 102, 0.22);
+}
+
+.jammer-info-label {
+    font-size: 0.68rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+}
+
+.jammer-info-label--true { color: #ff5470; }
+.jammer-info-label--est  { color: #ffd166; }
+.jammer-info-label--err  { color: #83a9bf; }
+
+.jammer-info-value {
+    color: var(--text);
+    font-size: 0.75rem;
+    font-weight: 700;
+    overflow-wrap: anywhere;
+    line-height: 1.4;
+}
+
+/* Large error value display */
+.jammer-error-value {
+    font-size: 1.28rem;
+    font-weight: 900;
+    letter-spacing: -0.01em;
+    margin-top: 2px;
+    transition: color 0.4s ease;
+}
+
+.jammer-error-value--na   { color: #83a9bf !important; font-size: 1.05rem; }
+.jammer-error-value--good { text-shadow: 0 0 12px rgba(77, 255, 136, 0.45); }
+.jammer-error-value--warn { text-shadow: 0 0 12px rgba(255, 209, 102, 0.45); }
+.jammer-error-value--bad  { text-shadow: 0 0 12px rgba(255, 84, 112, 0.45); }
 
 
-@dataclass(frozen=True)
-class SimulationParameters:
-    coupling_strength: float
-    noise_level: float
-    drift_intensity: float
-    gnss_enabled: bool
+/* ── Live Coordinate Readout Widget ─────────────────────────────── */
+.jammer-coord-readout {
+    margin-top: 14px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid rgba(53, 246, 255, 0.20);
+    background: linear-gradient(135deg, rgba(10, 23, 40, 0.96) 0%, rgba(5, 14, 26, 0.96) 100%);
+    box-shadow: 0 0 18px rgba(53, 246, 255, 0.06);
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
 
+.jammer-coord-readout:hover {
+    border-color: rgba(53, 246, 255, 0.38);
+    box-shadow: 0 0 22px rgba(53, 246, 255, 0.12);
+}
 
-@dataclass(frozen=True)
-class SimulationSnapshot:
-    time_s: float
-    node_names: tuple[str, ...]
-    latitudes: np.ndarray
-    longitudes: np.ndarray
-    proposed_theta: np.ndarray
-    baseline_theta: np.ndarray
-    proposed_error_ns: np.ndarray
-    baseline_error_ns: np.ndarray
-    proposed_rms_ns: float
-    baseline_rms_ns: float
-    order_parameter: float
-    temperatures_c: np.ndarray
-    history_time_s: np.ndarray
-    history_proposed_rms_ns: np.ndarray
-    history_baseline_rms_ns: np.ndarray
+.coord-readout-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 10px;
+}
 
+.coord-readout-label {
+    font-size: 0.67rem;
+    font-weight: 800;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--muted);
+}
 
-class KuramotoClockNetwork:
-    """Vectorized six-node RF clock synchronization model."""
+.coord-readout-values {
+    display: flex;
+    align-items: center;
+    gap: 0;
+}
 
-    def __init__(self, seed: int = RNG_SEED) -> None:
-        self._seed = seed
-        self._rng = np.random.default_rng(seed)
-        self._node_count = len(NODES)
-        self._distances_m = self._distance_matrix_m()
-        self._topology = self._topology_matrix()
-        self._delay_phase = self._delay_phase_matrix()
+.coord-value-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    flex: 1;
+    gap: 4px;
+}
 
-        self._frequency_bias_ppm = np.array(
-            [0.010, -0.016, 0.021, -0.018, 0.014, -0.011],
-            dtype=float,
-        )
-        self._natural_frequency_rate = self._ppm_to_phase_rate(
-            self._frequency_bias_ppm
-        )
-        self._temp_coeff_ppm = np.array(
-            [0.00074, 0.00088, 0.00070, 0.00095, 0.00082, 0.00079],
-            dtype=float,
-        )
-        self._aging_ppm_per_hour = np.array(
-            [0.0018, -0.0011, 0.0015, -0.0016, 0.0012, -0.0014],
-            dtype=float,
-        )
-        self._thermal_phase = np.linspace(
-            0.0,
-            2.0 * np.pi,
-            self._node_count,
-            endpoint=False,
-        )
-        self.reset()
+.coord-axis-tag {
+    font-size: 0.60rem;
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--cyan);
+    opacity: 0.65;
+}
 
-    def reset(self) -> None:
-        self.time_s = 0.0
-        initial_theta = self._rng.uniform(-0.55, 0.55, self._node_count)
-        self.proposed_theta = initial_theta.copy()
-        self.baseline_theta = initial_theta.copy()
-        self.temperatures_c = self._temperature_profile(0.0)
-        self.history_time_s = np.array([], dtype=float)
-        self.history_proposed_rms_ns = np.array([], dtype=float)
-        self.history_baseline_rms_ns = np.array([], dtype=float)
-        self._append_history()
+.coord-axis-value {
+    font-size: 0.98rem;
+    font-weight: 800;
+    color: var(--cyan);
+    letter-spacing: 0.02em;
+    text-shadow: 0 0 10px rgba(53, 246, 255, 0.50);
+    transition: color 0.2s ease, text-shadow 0.2s ease;
+    font-variant-numeric: tabular-nums;
+}
 
-    def step(self, dt_s: float, params: SimulationParameters) -> SimulationSnapshot:
-        self.time_s += dt_s
-        self.temperatures_c = self._temperature_profile(self.time_s)
+.coord-divider {
+    width: 1px;
+    height: 36px;
+    background: rgba(53, 246, 255, 0.22);
+    margin: 0 10px;
+    flex-shrink: 0;
+}
 
-        if params.gnss_enabled:
-            self.proposed_theta = np.zeros(self._node_count, dtype=float)
-            self.baseline_theta = np.zeros(self._node_count, dtype=float)
-            self._append_history()
-            return self.snapshot()
+/* Map marker legend hint below coordinate readout */
+.coord-map-hint {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(53, 246, 255, 0.10);
+}
 
-        drift_rate = self._oscillator_drift_rate(
-            self.temperatures_c,
-            self.time_s,
-            params.drift_intensity,
-        )
-        noise_rate = self._rng.normal(
-            loc=0.0,
-            scale=params.noise_level,
-            size=self._node_count,
-        )
+.coord-hint-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
 
-        baseline_rate = (
-            self._natural_frequency_rate
-            + self._kuramoto_rate(self.baseline_theta, params.coupling_strength)
-            + drift_rate
-            + noise_rate
-        )
-        proposed_rate = (
-            self._natural_frequency_rate
-            + self._kuramoto_rate(self.proposed_theta, params.coupling_strength)
-            + drift_rate
-            + noise_rate
-            - self._pinn_drift_correction(
-                self.proposed_theta,
-                self.temperatures_c,
-                self.time_s,
-                params.drift_intensity,
-            )
-        )
-
-        self.baseline_theta = self.baseline_theta + dt_s * baseline_rate
-        self.proposed_theta = self.proposed_theta + dt_s * proposed_rate
-        self._append_history()
-        return self.snapshot()
-
-    def snapshot(self) -> SimulationSnapshot:
-        proposed_error = self._phase_to_error_ns(self.proposed_theta)
-        baseline_error = self._phase_to_error_ns(self.baseline_theta)
-        proposed_rms = float(np.sqrt(np.mean(np.square(proposed_error))))
-        baseline_rms = float(np.sqrt(np.mean(np.square(baseline_error))))
-        order_parameter = float(
-            np.abs(np.mean(np.exp(1j * np.mod(self.proposed_theta, 2.0 * np.pi))))
-        )
-
-        return SimulationSnapshot(
-            time_s=float(self.time_s),
-            node_names=NODE_NAMES,
-            latitudes=LATITUDES.copy(),
-            longitudes=LONGITUDES.copy(),
-            proposed_theta=self.proposed_theta.copy(),
-            baseline_theta=self.baseline_theta.copy(),
-            proposed_error_ns=proposed_error,
-            baseline_error_ns=baseline_error,
-            proposed_rms_ns=proposed_rms,
-            baseline_rms_ns=baseline_rms,
-            order_parameter=order_parameter,
-            temperatures_c=self.temperatures_c.copy(),
-            history_time_s=self.history_time_s.copy(),
-            history_proposed_rms_ns=self.history_proposed_rms_ns.copy(),
-            history_baseline_rms_ns=self.history_baseline_rms_ns.copy(),
-        )
-
-    def _kuramoto_rate(
-        self,
-        theta: np.ndarray,
-        coupling_strength: float,
-    ) -> np.ndarray:
-        phase_delta = theta[np.newaxis, :] - theta[:, np.newaxis]
-        interaction = np.sin(phase_delta - self._delay_phase)
-        return coupling_strength * np.sum(self._topology * interaction, axis=1)
-
-    def _oscillator_drift_rate(
-        self,
-        temperatures_c: np.ndarray,
-        time_s: float,
-        drift_intensity: float,
-    ) -> np.ndarray:
-        thermal_offset_c = temperatures_c - 25.0
-        thermal_ppm = self._temp_coeff_ppm * np.square(thermal_offset_c)
-        aging_ppm = self._aging_ppm_per_hour * (time_s / 3600.0)
-        colored_model_error_ppm = 0.0016 * np.sin(
-            0.17 * time_s + self._thermal_phase
-        )
-        total_ppm = (
-            drift_intensity * (thermal_ppm + aging_ppm)
-            + colored_model_error_ppm
-        )
-        return self._ppm_to_phase_rate(total_ppm)
-
-    def _pinn_drift_correction(
-        self,
-        theta: np.ndarray,
-        temperatures_c: np.ndarray,
-        time_s: float,
-        drift_intensity: float,
-    ) -> np.ndarray:
-        physics_rate = self._physics_drift_predictor(
-            temperatures_c,
-            time_s,
-            drift_intensity,
-        )
-        holdover_anchor = 0.44 * np.tanh(theta / 0.70)
-        consensus_residual = 0.12 * (theta - np.mean(theta))
-        return physics_rate + holdover_anchor + consensus_residual
-
-    def _physics_drift_predictor(
-        self,
-        temperatures_c: np.ndarray,
-        time_s: float,
-        drift_intensity: float,
-    ) -> np.ndarray:
-        thermal_offset_c = temperatures_c - 25.0
-        nominal_thermal_ppm = 0.97 * self._temp_coeff_ppm * np.square(
-            thermal_offset_c
-        )
-        nominal_aging_ppm = 0.90 * self._aging_ppm_per_hour * (time_s / 3600.0)
-        nominal_bias_ppm = 0.95 * self._frequency_bias_ppm
-        drift_ppm = nominal_bias_ppm + drift_intensity * (
-            nominal_thermal_ppm + nominal_aging_ppm
-        )
-        return self._ppm_to_phase_rate(drift_ppm)
-
-    def _append_history(self) -> None:
-        proposed_error = self._phase_to_error_ns(self.proposed_theta)
-        baseline_error = self._phase_to_error_ns(self.baseline_theta)
-        proposed_rms = np.sqrt(np.mean(np.square(proposed_error)))
-        baseline_rms = np.sqrt(np.mean(np.square(baseline_error)))
-
-        self.history_time_s = np.append(self.history_time_s, self.time_s)
-        self.history_proposed_rms_ns = np.append(
-            self.history_proposed_rms_ns,
-            proposed_rms,
-        )
-        self.history_baseline_rms_ns = np.append(
-            self.history_baseline_rms_ns,
-            baseline_rms,
-        )
-
-        if self.history_time_s.size > MAX_HISTORY_POINTS:
-            self.history_time_s = self.history_time_s[-MAX_HISTORY_POINTS:]
-            self.history_proposed_rms_ns = self.history_proposed_rms_ns[
-                -MAX_HISTORY_POINTS:
-            ]
-            self.history_baseline_rms_ns = self.history_baseline_rms_ns[
-                -MAX_HISTORY_POINTS:
-            ]
-
-    def _temperature_profile(self, time_s: float) -> np.ndarray:
-        diurnal = 5.0 * np.sin((2.0 * np.pi * time_s / 180.0) + self._thermal_phase)
-        local_gradient = np.array([3.5, 0.5, 2.8, 4.0, 3.0, 1.2], dtype=float)
-        weather = 0.8 * np.sin((2.0 * np.pi * time_s / 51.0) + 0.7)
-        return 28.0 + local_gradient + diurnal + weather
-
-    def _distance_matrix_m(self) -> np.ndarray:
-        lat = np.radians(LATITUDES)
-        lon = np.radians(LONGITUDES)
-        lat_delta = lat[:, np.newaxis] - lat[np.newaxis, :]
-        lon_delta = lon[:, np.newaxis] - lon[np.newaxis, :]
-        haversine = (
-            np.sin(lat_delta / 2.0) ** 2
-            + np.cos(lat[:, np.newaxis])
-            * np.cos(lat[np.newaxis, :])
-            * np.sin(lon_delta / 2.0) ** 2
-        )
-        return 6_371_000.0 * 2.0 * np.arctan2(
-            np.sqrt(haversine),
-            np.sqrt(1.0 - haversine),
-        )
-
-    def _topology_matrix(self) -> np.ndarray:
-        topology = np.exp(-self._distances_m / 420_000.0)
-        np.fill_diagonal(topology, 0.0)
-        row_sum = np.sum(topology, axis=1, keepdims=True)
-        return np.divide(topology, row_sum, out=np.zeros_like(topology), where=row_sum > 0)
-
-    def _delay_phase_matrix(self) -> np.ndarray:
-        propagation_s = self._distances_m / SPEED_OF_LIGHT_MPS
-        phase = 2.0 * np.pi * propagation_s / SYNC_WAVE_PERIOD_S
-        np.fill_diagonal(phase, 0.0)
-        return phase
-
-    @staticmethod
-    def _ppm_to_phase_rate(ppm: np.ndarray) -> np.ndarray:
-        return 2.0 * np.pi * CLOCK_FREQUENCY_HZ * ppm * 1.0e-6
-
-    @staticmethod
-    def _phase_to_error_ns(theta: np.ndarray) -> np.ndarray:
-        return theta * NS_PER_RADIAN
+.coord-hint-text {
+    font-size: 0.65rem;
+    color: var(--muted);
+    line-height: 1.3;
+}
